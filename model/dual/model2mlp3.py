@@ -1,17 +1,12 @@
 import torch
 import torch.nn as nn
-from transformer import FTTransformer
-from mamba import (
+from ft_transformer import FTTransformer
+from model_mamba7CBAM4mutiscalek import (
     vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2
 )
 
 
 class ScoringSystem(nn.Module):
-    """
-    单个打分系统: Linear -> GELU -> Dropout -> Linear -> Sigmoid
-    输入 concat 特征 (B, 2*fusion_dim), 输出权重 w (B, fusion_dim), 每通道独立 ∈ (0,1).
-    w 用于加权融合: fusion = vision * w + (1 - w) * tabular
-    """
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.fc = nn.Sequential(
@@ -23,57 +18,77 @@ class ScoringSystem(nn.Module):
 
     def forward(self, x):
         # x: (B, in_dim)
-        return torch.sigmoid(self.fc(x))   # (B, out_dim), 元素独立 ∈ (0,1)
+        return torch.sigmoid(self.fc(x))
 
 
 class DualBranchModel(nn.Module):
-    """
-    双分支融合模型 (多 Scorer + 每路独立 MLP 非线性聚合):
-      分支1 (图像分支): VisionMamba + 表格辅助 -> 192 -> 投影到 fusion_dim
-      分支2 (表格分支): FTTransformer (区分类别/数值) -> ft_dim -> 投影到 fusion_dim
-      融合:
-        concat([v, t]) -> N 个独立 Scorer -> 权重 w_i
-        fusion_i = v * w_i + (1 - w_i) * t
-        out_i    = mlp_i(fusion_i)              # ← 关键: 每路独立非线性, 打破线性退化
-        fused    = mean_i(out_i)                # N 路求平均
-        logits   = classifier(fused)
+    DEPTH = None
+    NUM_SCORERS = None
+    FUSION_DIM = None
 
-    与 model2.py 的区别:
-      model2.py 中 fused = mean_i(v*w_i + (1-w_i)*t) = v*mean(w_i) + (1-mean(w_i))*t,
-      数学上等价于单个 Scorer (mean(w_i)), N 路在求和阶段被代数坍缩.
-      本文件在每路输出上插入独立 MLP(mlp_i), 求和不能再提出, N 路真正起作用.
-    """
     def __init__(
         self,
-        # ---- FTTransformer 参数 ----
         categories,
         num_continuous,
         ft_dim=32,
-        ft_depth=4,
+        ft_depth=None,
         ft_heads=4,
         ft_dim_head=8,
         ft_attn_dropout=0.1,
         ft_ff_dropout=0.1,
-        # ---- VisionMamba 参数 ----
         vim_embed_dim=192,
         vim_num_classes=2,
         text_feature_dim=37,
-        # ---- 融合参数 ----
-        fusion_dim=32,
-        num_scorers=3,
+        fusion_dim=None,
+        num_scorers=None,
         num_classes=2,
+        *,
+        vim_depth=None,
     ):
         super().__init__()
 
+        if fusion_dim is None:
+            fusion_dim = self.FUSION_DIM if self.FUSION_DIM is not None else 32
+        if type(fusion_dim) is not int or fusion_dim not in (32, 192):
+            raise ValueError(f"fusion_dim must be 32 or 192, got {fusion_dim!r}")
+        if self.FUSION_DIM is not None and fusion_dim != self.FUSION_DIM:
+            raise ValueError(
+                f"{type(self).__name__} requires fusion_dim={self.FUSION_DIM}, "
+                f"got {fusion_dim}"
+            )
+
+        if self.NUM_SCORERS is not None:
+            if num_scorers is not None and num_scorers != self.NUM_SCORERS:
+                raise ValueError(
+                    f"{type(self).__name__} requires num_scorers={self.NUM_SCORERS}, "
+                    f"got {num_scorers}"
+                )
+            num_scorers = self.NUM_SCORERS
+        elif num_scorers is None:
+            num_scorers = 3
+
+        if self.DEPTH is not None:
+            for name, value in (("ft_depth", ft_depth), ("vim_depth", vim_depth)):
+                if value is not None and value != self.DEPTH:
+                    raise ValueError(
+                        f"{type(self).__name__} requires {name}={self.DEPTH}, got {value}"
+                    )
+            ft_depth = vim_depth = self.DEPTH
+        else:
+            ft_depth = 4 if ft_depth is None else ft_depth
+            vim_depth = 4 if vim_depth is None else vim_depth
+
+        self.ft_depth = ft_depth
+        self.vim_depth = vim_depth
         self.fusion_dim = fusion_dim
         self.num_classes = num_classes
         self.num_scorers = num_scorers
 
-        # =============== 分支1: VisionMamba (图像 + 表格辅助) ===============
         self.vision_branch = vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2(
             pretrained=False,
+            depth=vim_depth,
             num_classes=vim_num_classes,
-            use_text_features=True,
+            use_text_fusion=True,
             text_feature_dim=text_feature_dim,
         )
         self.vision_proj = nn.Sequential(
@@ -82,7 +97,6 @@ class DualBranchModel(nn.Module):
             nn.GELU(),
         )
 
-        # =============== 分支2: FTTransformer (表格, 区分类别/数值) ===============
         self.tabular_branch = FTTransformer(
             categories=categories,
             num_continuous=num_continuous,
@@ -100,16 +114,11 @@ class DualBranchModel(nn.Module):
             nn.GELU(),
         )
 
-        # =============== N 个独立打分系统 ===============
-        # 输入: concat(vision, tabular) = 2*fusion_dim
-        # 输出: 权重 w_i (fusion_dim 维)
         self.scorers = nn.ModuleList([
             ScoringSystem(in_dim=fusion_dim * 2, out_dim=fusion_dim)
             for _ in range(num_scorers)
         ])
 
-        # =============== N 个独立 fusion MLP (每路非线性, 打破线性退化) ===============
-        # 输入/输出均为 fusion_dim 维
         self.fusion_mlps = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(fusion_dim, fusion_dim),
@@ -120,7 +129,6 @@ class DualBranchModel(nn.Module):
             for _ in range(num_scorers)
         ])
 
-        # =============== 分类头 ===============
         self.classifier = nn.Sequential(
             nn.LayerNorm(fusion_dim),
             nn.GELU(),
@@ -129,43 +137,134 @@ class DualBranchModel(nn.Module):
         )
 
         print(f"\n{'=' * 80}")
-        print("DualBranchModel (多Scorer + 每路独立MLP非线性聚合) 初始化完成")
-        print(f"   分支1 (VisionMamba):   embed_dim={vim_embed_dim} -> {fusion_dim}")
-        print(f"   分支2 (FTTransformer): dim={ft_dim} -> {fusion_dim}")
+        print(f"{type(self).__name__} (多Scorer + 每路独立MLP非线性聚合) 初始化完成")
+        print(f"   分支1 (VisionMamba):   depth={vim_depth}, embed_dim={vim_embed_dim} -> {fusion_dim}")
+        print(f"   分支2 (FTTransformer): depth={ft_depth}, dim={ft_dim} -> {fusion_dim}")
         print(f"   打分系统: {num_scorers} 个独立 Scorer, 输入={fusion_dim*2}, 输出权重={fusion_dim}")
         print(f"   每路融合: mlp_i(v*w_i + (1-w_i)*t), {num_scorers} 路求平均 -> {fusion_dim} -> {num_classes} classes")
         print(f"{'=' * 80}\n")
 
     def forward(self, images, features, x_categ, x_numer):
-        """
-        参数:
-            images:   (B, 3, H, W)
-            features: (B, NUM_FEATURE_COLS) 完整表格特征, 给 VisionMamba 做辅助
-            x_categ:  (B, num_cat_cols) 分类特征(整数)
-            x_numer:  (B, num_num_cols) 数值特征(浮点)
-        返回:
-            logits: (B, num_classes)
-        """
-        # ---- 分支1: VisionMamba (图像 + 表格辅助) ----
         vision_feat = self.vision_branch(images, text_features=features, return_features=True)
         vision_feat = self.vision_proj(vision_feat)        # (B, fusion_dim)
 
-        # ---- 分支2: FTTransformer (表格, 区分类别/数值) ----
         tabular_feat = self.tabular_branch(x_categ, x_numer, return_features=True)
         tabular_feat = self.tabular_proj(tabular_feat)     # (B, fusion_dim)
 
-        # ---- concat 作为打分系统的输入 ----
         concat_feat = torch.cat([vision_feat, tabular_feat], dim=1)  # (B, 2*fusion_dim)
 
-        # ---- N 个打分系统生成权重并加权融合, 每路独立 MLP 非线性 ----
         fused = torch.zeros_like(vision_feat)              # (B, fusion_dim)
         for scorer, mlp in zip(self.scorers, self.fusion_mlps):
             w_i = scorer(concat_feat)                      # (B, fusion_dim), ∈(0,1)
             fusion_i = vision_feat * w_i + (1 - w_i) * tabular_feat   # (B, fusion_dim)
-            fused = fused + mlp(fusion_i)                  # ← 关键: 独立非线性后累加
+            fused = fused + mlp(fusion_i)
 
-        fused = fused / self.num_scorers                   # 求平均
+        fused = fused / self.num_scorers
 
-        # ---- 分类 ----
         logits = self.classifier(fused)                    # (B, num_classes)
         return logits
+
+
+class DualBranchModelA(DualBranchModel):
+
+    DEPTH = 4
+
+
+class DualBranchModelB(DualBranchModel):
+
+    DEPTH = 8
+
+
+class DualBranchModelC(DualBranchModel):
+
+    DEPTH = 12
+
+
+class DualBranchModelA_3(DualBranchModelA):
+
+    NUM_SCORERS = 3
+
+
+class DualBranchModelA_4(DualBranchModelA):
+
+    NUM_SCORERS = 4
+
+
+class DualBranchModelB_3(DualBranchModelB):
+
+    NUM_SCORERS = 3
+
+
+class DualBranchModelB_4(DualBranchModelB):
+
+    NUM_SCORERS = 4
+
+
+class DualBranchModelC_3(DualBranchModelC):
+
+    NUM_SCORERS = 3
+
+
+class DualBranchModelC_4(DualBranchModelC):
+
+    NUM_SCORERS = 4
+
+
+class DualBranchModelA_3_32(DualBranchModelA_3):
+
+    FUSION_DIM = 32
+
+
+class DualBranchModelA_3_192(DualBranchModelA_3):
+
+    FUSION_DIM = 192
+
+
+class DualBranchModelA_4_32(DualBranchModelA_4):
+
+    FUSION_DIM = 32
+
+
+class DualBranchModelA_4_192(DualBranchModelA_4):
+
+    FUSION_DIM = 192
+
+
+class DualBranchModelB_3_32(DualBranchModelB_3):
+
+    FUSION_DIM = 32
+
+
+class DualBranchModelB_3_192(DualBranchModelB_3):
+
+    FUSION_DIM = 192
+
+
+class DualBranchModelB_4_32(DualBranchModelB_4):
+
+    FUSION_DIM = 32
+
+
+class DualBranchModelB_4_192(DualBranchModelB_4):
+
+    FUSION_DIM = 192
+
+
+class DualBranchModelC_3_32(DualBranchModelC_3):
+
+    FUSION_DIM = 32
+
+
+class DualBranchModelC_3_192(DualBranchModelC_3):
+
+    FUSION_DIM = 192
+
+
+class DualBranchModelC_4_32(DualBranchModelC_4):
+
+    FUSION_DIM = 32
+
+
+class DualBranchModelC_4_192(DualBranchModelC_4):
+
+    FUSION_DIM = 192
